@@ -1,0 +1,980 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>APEX — Your Smart AI Assistant</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&amp;family=DM+Mono:ital,wght@0,400;0,500;1,400&amp;family=DM+Sans:wght@300;400;500&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #111118;
+    --card: #16161f;
+    --border: #2a2a3a;
+    --accent: #6c63ff;
+    --accent2: #ff6584;
+    --accent3: #43e97b;
+    --accent4: #f7971e;
+    --text: #e8e8f0;
+    --muted: #7a7a9a;
+    --code-bg: #0d0d14;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* Animated background */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 60% 40% at 20% 10%, rgba(108,99,255,0.12) 0%, transparent 60%),
+      radial-gradient(ellipse 50% 30% at 80% 80%, rgba(255,101,132,0.08) 0%, transparent 60%),
+      radial-gradient(ellipse 40% 40% at 50% 50%, rgba(67,233,123,0.04) 0%, transparent 70%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  header {
+    position: relative;
+    z-index: 10;
+    padding: 18px 28px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    background: rgba(10,10,15,0.85);
+    backdrop-filter: blur(12px);
+  }
+
+  .logo {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 1.5rem;
+    letter-spacing: -0.02em;
+    background: linear-gradient(135deg, #6c63ff 0%, #a78bfa 50%, #ff6584 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .logo-tag {
+    font-size: 0.7rem;
+    font-family: 'DM Mono', monospace;
+    color: var(--muted);
+    border: 1px solid var(--border);
+    padding: 2px 8px;
+    border-radius: 20px;
+    margin-top: 2px;
+  }
+
+  .mode-tabs {
+    display: flex;
+    gap: 6px;
+    margin-left: auto;
+    flex-wrap: wrap;
+  }
+
+  .tab {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    transition: all 0.2s;
+    letter-spacing: 0.04em;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .tab:hover { border-color: var(--accent); color: var(--text); }
+  .tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .tab.active.school { background: #f7971e; border-color: #f7971e; }
+  .tab.active.grammar { background: #43e97b; border-color: #43e97b; color: #0a0a0f; }
+  .tab.active.ideas { background: #ff6584; border-color: #ff6584; }
+
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    max-width: 900px;
+    margin: 0 auto;
+    width: 100%;
+    padding: 24px 20px;
+    position: relative;
+    z-index: 1;
+  }
+
+  .mode-banner {
+    padding: 12px 18px;
+    border-radius: 10px;
+    margin-bottom: 18px;
+    font-size: 0.82rem;
+    font-family: 'DM Mono', monospace;
+    border: 1px solid var(--border);
+    background: var(--card);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    animation: fadeSlide 0.3s ease;
+  }
+
+  @keyframes fadeSlide {
+    from { opacity: 0; transform: translateY(-6px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .mode-banner .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .chat-area {
+    flex: 1;
+    min-height: 380px;
+    max-height: 55vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 4px 0 10px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  .chat-area::-webkit-scrollbar { width: 4px; }
+  .chat-area::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  .msg {
+    display: flex;
+    gap: 12px;
+    animation: msgIn 0.25s ease;
+  }
+
+  @keyframes msgIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .msg.user { flex-direction: row-reverse; }
+
+  .avatar {
+    width: 32px; height: 32px;
+    border-radius: 8px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 0.85rem;
+    flex-shrink: 0;
+    font-weight: 700;
+    font-family: 'Syne', sans-serif;
+  }
+
+  .avatar.ai { background: linear-gradient(135deg, var(--accent), #a78bfa); color: #fff; }
+  .avatar.user-av { background: var(--card); border: 1px solid var(--border); color: var(--muted); }
+
+  .bubble {
+    max-width: 82%;
+    padding: 12px 16px;
+    border-radius: 12px;
+    font-size: 0.9rem;
+    line-height: 1.65;
+    border: 1px solid var(--border);
+  }
+
+  .msg.ai .bubble {
+    background: var(--card);
+    border-radius: 4px 12px 12px 12px;
+  }
+
+  .msg.user .bubble {
+    background: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 12px 4px 12px 12px;
+    color: #fff;
+  }
+
+  /* Code blocks inside responses */
+  .bubble pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin: 10px 0 4px;
+    overflow-x: auto;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    color: #a8d8a8;
+    position: relative;
+  }
+
+  .bubble pre .lang-tag {
+    position: absolute;
+    top: 6px; right: 10px;
+    font-size: 0.65rem;
+    color: var(--muted);
+    font-family: 'DM Mono', monospace;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  .bubble p { margin-bottom: 6px; }
+  .bubble p:last-child { margin-bottom: 0; }
+
+  .bubble .badge {
+    display: inline-block;
+    font-size: 0.68rem;
+    font-family: 'DM Mono', monospace;
+    padding: 2px 8px;
+    border-radius: 4px;
+    margin-bottom: 8px;
+    letter-spacing: 0.06em;
+  }
+
+  .badge.code-badge { background: rgba(108,99,255,0.2); color: #a78bfa; border: 1px solid rgba(108,99,255,0.3); }
+  .badge.school-badge { background: rgba(247,151,30,0.2); color: #f7971e; border: 1px solid rgba(247,151,30,0.3); }
+  .badge.grammar-badge { background: rgba(67,233,123,0.2); color: #43e97b; border: 1px solid rgba(67,233,123,0.3); }
+  .badge.ideas-badge { background: rgba(255,101,132,0.2); color: #ff6584; border: 1px solid rgba(255,101,132,0.3); }
+
+  .grammar-diff {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px 14px;
+    margin: 8px 0;
+    font-size: 0.85rem;
+    line-height: 1.7;
+  }
+
+  .grammar-diff .original { color: #ff7e7e; text-decoration: line-through; }
+  .grammar-diff .corrected { color: #43e97b; }
+  .grammar-diff .arrow { color: var(--muted); margin: 0 6px; }
+
+  .idea-card {
+    background: var(--code-bg);
+    border-left: 3px solid var(--accent2);
+    padding: 8px 12px;
+    margin: 6px 0;
+    border-radius: 0 6px 6px 0;
+    font-size: 0.85rem;
+  }
+
+  .idea-card .idea-num {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--accent2);
+    margin-bottom: 4px;
+  }
+
+  /* Thinking indicator */
+  .thinking {
+    display: flex; gap: 5px; align-items: center;
+    padding: 14px 16px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 4px 12px 12px 12px;
+    width: fit-content;
+  }
+
+  .thinking span {
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: bounce 1.2s infinite;
+  }
+
+  .thinking span:nth-child(2) { animation-delay: 0.2s; background: #a78bfa; }
+  .thinking span:nth-child(3) { animation-delay: 0.4s; background: var(--accent2); }
+
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+    30% { transform: translateY(-5px); opacity: 1; }
+  }
+
+  /* Input area */
+  .input-area {
+    margin-top: 16px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 6px 6px 6px 16px;
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    transition: border-color 0.2s;
+  }
+
+  .input-area:focus-within { border-color: var(--accent); }
+
+  textarea {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 0.92rem;
+    resize: none;
+    min-height: 44px;
+    max-height: 160px;
+    padding: 10px 0;
+    line-height: 1.5;
+  }
+
+  textarea::placeholder { color: var(--muted); }
+
+  .send-btn {
+    width: 40px; height: 40px;
+    border-radius: 10px;
+    background: var(--accent);
+    border: none;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s;
+    flex-shrink: 0;
+    font-size: 1.1rem;
+  }
+
+  .send-btn:hover { background: #7c73ff; transform: scale(1.05); }
+  .send-btn:active { transform: scale(0.95); }
+  .send-btn:disabled { background: var(--border); cursor: not-allowed; transform: none; }
+
+  .hints {
+    display: flex; gap: 8px; flex-wrap: wrap;
+    margin-top: 10px;
+  }
+
+  .hint-chip {
+    font-size: 0.73rem;
+    padding: 5px 12px;
+    border-radius: 20px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    cursor: pointer;
+    font-family: 'DM Mono', monospace;
+    transition: all 0.18s;
+    white-space: nowrap;
+  }
+
+  .hint-chip:hover { border-color: var(--accent); color: var(--text); background: rgba(108,99,255,0.08); }
+
+  .empty-state {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    gap: 12px;
+    text-align: center;
+  }
+
+  .empty-icon {
+    font-size: 3rem;
+    margin-bottom: 8px;
+    animation: float 3s ease-in-out infinite;
+  }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-8px); }
+  }
+
+  .empty-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 1.6rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #6c63ff, #ff6584);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .empty-sub {
+    color: var(--muted);
+    font-size: 0.88rem;
+    max-width: 380px;
+    line-height: 1.6;
+  }
+
+  .feature-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin-top: 16px;
+    width: 100%;
+    max-width: 480px;
+  }
+
+  .feature-item {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .feature-item:hover { border-color: var(--accent); background: rgba(108,99,255,0.06); }
+  .feature-item .fi-icon { font-size: 1.3rem; margin-bottom: 6px; }
+  .feature-item .fi-title { font-weight: 600; font-size: 0.82rem; margin-bottom: 2px; }
+  .feature-item .fi-desc { color: var(--muted); font-size: 0.75rem; line-height: 1.4; }
+
+  @media (max-width: 600px) {
+    .mode-tabs { gap: 4px; }
+    .tab { font-size: 0.65rem; padding: 5px 10px; }
+    .feature-grid { grid-template-columns: 1fr 1fr; }
+    header { padding: 14px 16px; }
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<header>
+  <div>
+    <div class="logo">APEX</div>
+    <div class="logo-tag">AI Assistant v1.0</div>
+  </div>
+  <div class="mode-tabs">
+    <button class="tab active" data-mode="code" onclick="setMode(&#39;code&#39;,this)">⌨️ Code</button>
+    <button class="tab" data-mode="school" onclick="setMode(&#39;school&#39;,this)">📚 School</button>
+    <button class="tab" data-mode="grammar" onclick="setMode(&#39;grammar&#39;,this)">✏️ Grammar</button>
+    <button class="tab" data-mode="ideas" onclick="setMode(&#39;ideas&#39;,this)">💡 Ideas</button>
+  </div>
+</header>
+
+<div class="main">
+  <div class="mode-banner" id="modeBanner" style="animation: 0.3s ease 0s 1 normal none running fadeSlide;">
+    <span class="dot" style="background: rgb(108, 99, 255);"></span>
+    <span id="bannerText">Code Mode — Get clean, well-commented, production-quality code with explanations.</span>
+  </div>
+
+  <div class="chat-area" id="chatArea">
+    
+  <div class="msg user"><div class="avatar user-av">U</div><div class="bubble">Give me 5 creative app ideas I could build as a beginner programmer</div></div><div class="msg ai"><div class="avatar ai">A</div><div class="bubble"><span class="badge code-badge">⌨️ CODE</span><br><p># 🚀 5 Creative App Ideas for Beginner Programmers</p><p><strong>1. Mood-Based Music Playlist Generator</strong><br>A simple app where you select your current mood (happy, sad, energetic, chill) and it generates a playlist or recommends songs. WHY IT'S GREAT: You'll learn API integration (Spotify API), basic UI design, and data handling—all fundamental skills—while creating something you'll actually use daily!</p><p><strong>2. "Habit Streak" Tracker with Pet Companion</strong><br>Track your daily habits, but here's the twist: you have a virtual pet that grows healthier/happier as you maintain streaks. WHY IT'S INTERESTING: Combines gamification with productivity, teaches you about local data storage, notifications, and simple animations. Plus, it's genuinely motivating!</p><p><strong>3. Recipe Remix Generator</strong><br>Input ingredients you have at home, and the app suggests creative recipe combinations. WHY IT'S USEFUL: Solves a real problem (food waste + decision fatigue), teaches you about search algorithms, filtering data, and potentially AI integration if you want to level up later.</p><p><strong>4. "Micro-Journal" with Photo Emotions</strong><br>Instead of long journal entries, snap a photo and add one sentence about your day. The app creates a visual timeline. WHY IT'S COOL: Teaches camera integration, image handling, database management, and creates a beautiful personal archive you'll treasure.</p><p><strong>5. Local Event Countdown Widget</strong><br>Create countdowns to events YOU care about (concerts, trips, deadlines) with custom backgrounds and share widgets with friends. WHY IT'S PRACTICAL: You'll learn date/time manipulation, widget development, notifications, and sharing functionality—all commonly used features in professional apps.</p><p><strong>What type of apps interest you most—productivity tools, creative outlets, or something social?</strong> That'll help me suggest which one to start with! 💡</p></div></div><div class="msg user"><div class="avatar user-av">U</div><div class="bubble">help me give a good idea to write my essy</div></div><div class="msg ai"><div class="avatar ai">A</div><div class="bubble"><span class="badge code-badge">⌨️ CODE</span><br><p># 📝 Essay Topic Brainstorming Guide</p><p>To help you find a <strong>great</strong> essay topic, I need to know a bit more:</p><p>## Quick Questions:</p><p>1. <strong>What type of essay?</strong><br>   - Argumentative/Persuasive<br>   - Narrative/Personal<br>   - Analytical/Research<br>   - Compare/Contrast<br>   - Descriptive</p><p>2. <strong>What's the general subject area?</strong><br>   - Literature<br>   - History<br>   - Science/Technology<br>   - Social Issues<br>   - Personal Experience<br>   - Other?</p><p>3. <strong>Any requirements?</strong><br>   - Length (words/pages)<br>   - Specific theme from your teacher<br>   - Any topics to avoid</p><p>---</p><p>## 💡 But here are some <strong>universally strong essay ideas</strong> to get you started:</p><p><strong>ARGUMENTATIVE:</strong><br>- "Social media does more harm than good to teen mental health"<br>- "Should AI-generated art be considered 'real' art?"<br>- "Why financial literacy should be mandatory in schools"</p><p><strong>PERSONAL/NARRATIVE:</strong><br>- A moment when failure taught you something valuable<br>- How a specific person changed your perspective on life<br>- The culture shock of moving to a new place/school</p><p><strong>ANALYTICAL:</strong><br>- How streaming services changed storytelling in TV shows<br>- The evolution of communication: From letters to texts<br>- Why certain songs/books become timeless</p><p><strong>SOCIAL ISSUES:</strong><br>- The hidden cost of fast fashion<br>- How video games are breaking stigmas around gaming<br>- The impact of remote work on community connections</p><p>---</p><p><strong>Tell me more about your assignment and I'll help you craft a topic that's:</strong><br>✅ Interesting to YOU (so writing won't feel like torture)<br>✅ Specific enough to write well<br>✅ Original enough to stand out</p><p><strong>What subject is this for?</strong> 🎯</p></div></div><div class="msg user"><div class="avatar user-av">U</div><div class="bubble">copar and contrast essy</div></div><div class="msg ai"><div class="avatar ai">A</div><div class="bubble"><span class="badge code-badge">⌨️ CODE</span><br><p># ✍️ Compare and Contrast Essay Ideas</p><p>Here are <strong>5 solid topics</strong> organized by difficulty level:</p><p>---</p><p>## 🟢 EASIER (Great for beginners)</p><p><strong>1. Online Learning vs. Traditional Classroom Learning</strong><br>- Compare: flexibility, social interaction, learning outcomes, cost<br>- *Why it works:* You have personal experience with both!</p><p><strong>2. Books vs. Movies (of the same story)</strong><br>- Compare: imagination, pacing, details, emotional impact<br>- *Why it works:* Pick a story you know well (Harry Potter, The Hunger Games, etc.)</p><p><strong>3. Living in a City vs. Living in a Suburb/Rural Area</strong><br>- Compare: lifestyle, cost, opportunities, community, pace of life<br>- *Why it works:* Concrete differences that are easy to observe</p><p>---</p><p>## 🟡 INTERMEDIATE (More interesting)</p><p><strong>4. iPhone vs. Android Phones</strong><br>- Compare: user experience, customization, ecosystem, privacy, cost<br>- *Why it works:* Everyone has opinions, plenty of research available</p><p><strong>5. Fast Food vs. Home-Cooked Meals</strong><br>- Compare: health, cost, convenience, taste, environmental impact<br>- *Why it works:* Real-world relevance with measurable differences</p><p>---</p><p>## 🔵 ADVANCED (Stand-out topics)</p><p><strong>6. TikTok vs. YouTube: Different Approaches to Content Creation</strong><br>- Compare: content length, algorithm, creator income, audience engagement<br>- *Why it works:* Modern, relevant, shows you understand digital culture</p><p><strong>7. Introverts vs. Extroverts in the Workplace</strong><br>- Compare: communication styles, energy sources, strengths, work preferences<br>- *Why it works:* Psychological depth + practical applications</p><p><strong>8. Playing Sports vs. Watching Sports</strong><br>- Compare: physical benefits, community aspect, entertainment value, skills learned<br>- *Why it works:* Unexpected angle on a common topic</p><p>---</p><p>## 📋 ESSAY STRUCTURE TIP:</p><p><strong>Method 1 - Block Method:</strong><br>- Intro<br>- All about Subject A<br>- All about Subject B<br>- Conclusion (comparison)</p><p><strong>Method 2 - Point-by-Point (RECOMMENDED):</strong><br>- Intro<br>- Point 1: Compare A &amp; B<br>- Point 2: Compare A &amp; B<br>- Point 3: Compare A &amp; B<br>- Conclusion</p><p>---</p><p>## 🎯 My Recommendation:</p><p><strong>Start with #1 (Online vs. Traditional Learning)</strong> if you want something safe and easy.</p><p><strong>Go with #6 (TikTok vs. YouTube)</strong> if you want something that'll make your teacher say "Oh, this is interesting!"</p><p>---</p><p><strong>Which topic interests you most? Or tell me:</strong><br>- What subject is this essay for?<br>- Any specific interests you have?<br>- How long does it need to be?</p><p>I'll help you create an <strong>outline and thesis statement!</strong> 💪</p></div></div><div class="msg user"><div class="avatar user-av">U</div><div class="bubble">Write essay outline</div></div><div class="msg ai"><div class="avatar ai">A</div><div class="bubble"><span class="badge school-badge">📚 SCHOOL</span><br><p># 📝 Compare and Contrast Essay Outline</p><p>I'll create an outline for <strong>Online Learning vs. Traditional Classroom Learning</strong> (since it's relatable and you have experience with both!)</p><p>---</p><p>## <strong>I. INTRODUCTION</strong> (1 paragraph)</p><p><strong>A. Hook:</strong> Start with an interesting fact or question<br>   - *Example:* "In 2020, over 1.2 billion students worldwide suddenly switched to online learning—but was it better or worse?"</p><p><strong>B. Background:</strong> Brief context about both learning methods</p><p><strong>C. Thesis Statement:</strong> <br>   - *Example:* "While online learning offers flexibility and personalized pacing, traditional classroom learning provides essential social interaction and structured accountability, making each method valuable for different types of learners and situations."</p><p>---</p><p>## <strong>II. BODY PARAGRAPH 1 - Flexibility &amp; Convenience</strong></p><p><strong>A. Topic Sentence:</strong> Online and traditional learning differ significantly in flexibility and daily structure.</p><p><strong>B. Online Learning:</strong><br>   - Learn from anywhere (home, coffee shop, while traveling)<br>   - Set your own schedule (watch lectures at 2am if you want!)<br>   - Can replay lectures and review materials anytime<br>   - *Example:* Students with jobs can attend class after work</p><p><strong>C. Traditional Learning:</strong><br>   - Fixed schedule (must be in class at specific times)<br>   - Requires commuting to campus<br>   - Limited ability to review live lectures<br>   - *Example:* Keeps students on a routine, prevents procrastination</p><p><strong>D. Mini-conclusion:</strong> Online wins for convenience; traditional wins for structure</p><p>---</p><p>## <strong>III. BODY PARAGRAPH 2 - Social Interaction &amp; Collaboration</strong></p><p><strong>A. Topic Sentence:</strong> The quality and quantity of social interaction varies dramatically between both methods.</p><p><strong>B. Traditional Learning:</strong><br>   - Face-to-face discussions and debates<br>   - Spontaneous questions and immediate feedback<br>   - Build real friendships and study groups<br>   - Body language and energy in the room<br>   - *Example:* Group projects happen naturally after class</p><p><strong>C. Online Learning:</strong><br>   - Communication through chat, forums, video calls<br>   - Can feel isolating or disconnected<br>   - Easier for shy students to participate (type vs. speak)<br>   - Harder to build meaningful relationships<br>   - *Example:* Breakout rooms feel awkward compared to natural conversation</p><p><strong>D. Mini-conclusion:</strong> Traditional learning clearly superior for social development</p><p>---</p><p>## <strong>IV. BODY PARAGRAPH 3 - Learning Effectiveness &amp; Engagement</strong></p><p><strong>A. Topic Sentence:</strong> Student engagement and learning outcomes depend on teaching style and student personality.</p><p><strong>B. Online Learning:</strong><br>   - Self-paced allows mastery of difficult concepts<br>   - Easy to get distracted (Netflix, phone, games)<br>   - Access to diverse resources (videos, articles, simulations)<br>   - Requires strong self-discipline<br>   - *Example:* Visual learners benefit from rewatching demonstrations</p><p><strong>C. Traditional Learning:</strong><br>   - Teacher can read the room and adjust pace<br>   - Peer pressure keeps you focused<br>   - Hands-on activities and experiments<br>   - Immediate clarification of confusion<br>   - *Example:* Science labs are much better in person</p><p><strong>D. Mini-conclusion:</strong> Effectiveness depends on learning style and subject matter</p><p>---</p><p>## <strong>V. BODY PARAGRAPH 4 - Cost &amp; Accessibility</strong></p><p><strong>A. Topic Sentence:</strong> Financial and geographic barriers differ between learning methods.</p><p><strong>B. Online Learning:</strong><br>   - Often cheaper (no commute, housing, meal plans)<br>   - Accessible to people with disabilities<br>   - Reaches rural or international students<br>   - Requires reliable internet and technology<br>   - *Example:* A student in a small town can take Harvard courses</p><p><strong>C. Traditional Learning:</strong><br>   - Higher costs (tuition, housing, transportation, meals)<br>   - Limited by geographic location<br>   - Better access to campus resources (libraries, labs, counselors)<br>   - More financial aid options available<br>   - *Example:* Campus libraries offer research help and quiet study spaces</p><p><strong>D. Mini-conclusion:</strong> Online learning democratizes access; traditional offers richer resources</p><p>---</p><p>## <strong>VI. CONCLUSION</strong> (1 paragraph)</p><p><strong>A. Restate Thesis</strong> (in different words):<br>   - Both methods have distinct advantages depending on individual needs</p><p><strong>B. Summarize Main Points:</strong><br>   - Online = flexibility, accessibility, self-paced<br>   - Traditional = social skills, engagement</p></div></div><div class="msg user"><div class="avatar user-av">U</div><div class="bubble">code me a care game</div></div><div class="msg ai"><div class="avatar ai">A</div><div class="bubble"><span class="badge code-badge">⌨️ CODE</span><br><p># 🎮 Virtual Pet Care Game</p><p>I'll create a <strong>text-based virtual pet game</strong> in Python that's fun, interactive, and teaches you programming fundamentals!</p><p>```python<br>import time<br>import random<br>import os</p><p>class VirtualPet:<br>    def __init__(self, name):<br>        self.name = name<br>        self.hunger = 50      # 0 = starving, 100 = full<br>        self.happiness = 50   # 0 = depressed, 100 = ecstatic<br>        self.energy = 50      # 0 = exhausted, 100 = energized<br>        self.health = 100     # 0 = critical, 100 = perfect<br>        self.age = 0          # in days<br>        self.is_alive = True<br>        <br>    def get_mood(self):<br>        """Determine pet's mood based on stats"""<br>        avg_stat = (self.hunger + self.happiness + self.energy) / 3<br>        <br>        if avg_stat &gt;= 80:<br>            return "😊 Amazing"<br>        elif avg_stat &gt;= 60:<br>            return "🙂 Happy"<br>        elif avg_stat &gt;= 40:<br>            return "😐 Okay"<br>        elif avg_stat &gt;= 20:<br>            return "😟 Sad"<br>        else:<br>            return "😢 Miserable"<br>    <br>    def display_status(self):<br>        """Show the pet's current stats"""<br>        os.system('clear' if os.name == 'posix' else 'cls')  # Clear screen<br>        <br>        print("=" * 50)<br>        print(f"🐾  {self.name}'s Status  🐾")<br>        print("=" * 50)<br>        print(f"Age: {self.age} days")<br>        print(f"Mood: {self.get_mood()}")<br>        print(f"Health: {self.health}/100 {'❤️' * (self.health // 20)}")<br>        print(f"Hunger: {self.hunger}/100 {'🍖' * (self.hunger // 20)}")<br>        print(f"Happiness: {self.happiness}/100 {'⭐' * (self.happiness // 20)}")<br>        print(f"Energy: {self.energy}/100 {'⚡' * (self.energy // 20)}")<br>        print("=" * 50)<br>    <br>    def feed(self):<br>        """Feed your pet"""<br>        if self.hunger &gt;= 90:<br>            print(f"\n{self.name} is already full! 🤢")<br>            return<br>        <br>        foods = ["kibble", "treats", "a bone", "premium food"]<br>        food = random.choice(foods)<br>        <br>        self.hunger = min(100, self.hunger + 30)<br>        self.happiness = min(100, self.happiness + 10)<br>        print(f"\n🍖 You fed {self.name} some {food}!")<br>        print(f"{self.name} is munching happily! *nom nom nom*")<br>    <br>    def play(self):<br>        """Play with your pet"""<br>        if self.energy &lt; 20:<br>            print(f"\n{self.name} is too tired to play! 😴")<br>            print("Let them rest first!")<br>            return<br>        <br>        games = ["fetch", "tug-of-war", "hide and seek", "chase"]<br>        game = random.choice(games)<br>        <br>        self.happiness = min(100, self.happiness + 25)<br>        self.energy = max(0, self.energy - 20)<br>        self.hunger = max(0, self.hunger - 15)<br>        <br>        print(f"\n🎾 You played {game} with {self.name}!")<br>        print(f"{self.name} had so much fun! Tail wagging intensifies! 🐕")<br>    <br>    def sleep(self):<br>        """Let your pet rest"""<br>        if self.energy &gt;= 90:<br>            print(f"\n{self.name} isn't tired yet! 😃")<br>            return<br>        <br>        print(f</p></div></div><div class="msg user"><div class="avatar user-av">U</div><div class="bubble">car game</div></div><div class="msg ai"><div class="avatar ai">A</div><div class="bubble"><span class="badge code-badge">⌨️ CODE</span><br><p># 🏎️ Racing Car Game</p><p>I'll create an <strong>interactive racing game</strong> in Python! You'll dodge obstacles and try to get the highest score.</p><p>```python<br>import random<br>import time<br>import os<br>import sys</p><p>class CarGame:<br>    def __init__(self):<br>        self.width = 20<br>        self.height = 15<br>        self.car_pos = self.width // 2  # Car starts in middle<br>        self.obstacles = []<br>        self.score = 0<br>        self.speed = 0.3  # Game speed (lower = faster)<br>        self.game_over = False<br>        <br>    def clear_screen(self):<br>        """Clear the console screen"""<br>        os.system('clear' if os.name == 'posix' else 'cls')<br>    <br>    def draw_road(self):<br>        """Draw the game screen"""<br>        self.clear_screen()<br>        <br>        # Draw top border<br>        print("=" * (self.width + 2))<br>        print(f"🏁 SCORE: {self.score} 🏁".center(self.width + 2))<br>        print("=" * (self.width + 2))<br>        <br>        # Draw the road<br>        for row in range(self.height):<br>            line = ""<br>            <br>            for col in range(self.width):<br>                # Draw car at bottom<br>                if row == self.height - 1 and col == self.car_pos:<br>                    line += "🚗"<br>                # Draw obstacles<br>                elif any(obs['row'] == row and obs['col'] == col for obs in self.obstacles):<br>                    line += "🚧"<br>                # Draw road lines<br>                elif col == self.width // 3 or col == 2 * self.width // 3:<br>                    line += "¦"<br>                else:<br>                    line += " "<br>            <br>            print("|" + line + "|")<br>        <br>        # Draw bottom border<br>        print("=" * (self.width + 2))<br>        print("Controls: A = Left | D = Right | Q = Quit")<br>    <br>    def move_obstacles(self):<br>        """Move obstacles down the screen"""<br>        # Move existing obstacles down<br>        for obs in self.obstacles:<br>            obs['row'] += 1<br>        <br>        # Remove obstacles that went off screen<br>        self.obstacles = [obs for obs in self.obstacles if obs['row'] &lt; self.height]<br>        <br>        # Add new obstacle at top randomly<br>        if random.random() &lt; 0.3:  # 30% chance each frame<br>            lanes = [self.width // 6, self.width // 2, 5 * self.width // 6]<br>            new_obs = {<br>                'row': 0,<br>                'col': random.choice(lanes)<br>            }<br>            self.obstacles.append(new_obs)<br>    <br>    def check_collision(self):<br>        """Check if car hit an obstacle"""<br>        for obs in self.obstacles:<br>            if obs['row'] == self.height - 1 and obs['col'] == self.car_pos:<br>                return True<br>        return False<br>    <br>    def get_input(self):<br>        """Get player input (non-blocking)"""<br>        # This is a simplified version - works on most systems<br>        # For Windows, you might need msvcrt module<br>        try:<br>            if os.name == 'nt':  # Windows<br>                import msvcrt<br>                if msvcrt.kbhit():<br>                    key = msvcrt.getch().decode('utf-8').lower()<br>                    return key<br>            else:  # Unix/Linux/Mac<br>                import select<br>                if select.select([sys.stdin], [], [], 0)[0]:<br>                    key = sys.stdin.read(1).lower()<br>                    return key<br>        except:<br>            pass<br>        return None<br>    <br>    def move_car(self, direction):<br>        """Move the car left or right"""<br>        if direction == 'a' and self.car_pos &gt; 0:<br>            self.car_pos -= 1<br>        elif direction == 'd' and self.car_pos &lt; self.width - 1:<br>            </p></div></div></div>
+
+  <div class="input-area">
+    <textarea id="input" placeholder="Ask me anything…" rows="1" onkeydown="handleKey(event)" oninput="autoResize(this)" style="height: auto;"></textarea>
+    <button class="send-btn" id="sendBtn" onclick="sendMessage()">➤</button>
+  </div>
+
+  <div class="hints" id="hints"><span class="hint-chip" onclick="quickPrompt(&#39;JS fetch API&#39;)">JS fetch API</span><span class="hint-chip" onclick="quickPrompt(&#39;Python list sort&#39;)">Python list sort</span><span class="hint-chip" onclick="quickPrompt(&#39;Fix my bug&#39;)">Fix my bug</span><span class="hint-chip" onclick="quickPrompt(&#39;CSS flexbox&#39;)">CSS flexbox</span><span class="hint-chip" onclick="quickPrompt(&#39;SQL query help&#39;)">SQL query help</span></div>
+</div>
+
+<script>
+let currentMode = 'code';
+let messages = [];
+
+const modeConfig = {
+  code: {
+    color: '#6c63ff',
+    label: 'Code Mode — Get clean, well-commented, production-quality code with explanations.',
+    tabClass: '',
+    system: `You are APEX, an elite programming assistant. When helping with code:
+- Always write clean, well-structured, production-quality code
+- Add helpful inline comments
+- Explain what the code does in plain English after the code block
+- Suggest edge cases and improvements
+- Format code in proper markdown code blocks with the language specified
+- Be concise but thorough
+- If there's a bug, identify it clearly and fix it
+Never just dump code without explanation. Always teach.`,
+    hints: ['JS fetch API', 'Python list sort', 'Fix my bug', 'CSS flexbox', 'SQL query help']
+  },
+  school: {
+    color: '#f7971e',
+    label: 'School Mode — Homework help, essay writing, concept explanations.',
+    tabClass: 'school',
+    system: `You are APEX, a friendly and knowledgeable academic tutor. When helping with school work:
+- Explain concepts clearly at the right level
+- Use examples and analogies
+- Help structure essays with clear intro/body/conclusion
+- Break down complex problems step by step
+- Cite key facts when relevant
+- Be encouraging and supportive
+- For math, show every step clearly
+Make learning feel accessible and engaging.`,
+    hints: ['Explain photosynthesis', 'Write essay outline', 'Help with algebra', 'History summary', 'Science concept']
+  },
+  grammar: {
+    color: '#43e97b',
+    label: 'Grammar Mode — Fix spelling, grammar, style and make your writing shine.',
+    tabClass: 'grammar',
+    system: `You are APEX, a professional writing editor like Grammarly. When fixing writing:
+- Correct all spelling, grammar, and punctuation errors
+- Show what was WRONG and what is CORRECT (use format: ~~wrong~~ → correct)
+- Improve sentence flow and clarity
+- Suggest better word choices when relevant
+- Keep the writer's original voice and meaning
+- Give a short summary of the main issues found
+- Also provide the fully corrected version at the end
+Be supportive, not critical. Frame feedback positively.`,
+    hints: ['Fix my paragraph', 'Make this formal', 'Check my essay', 'Improve clarity', 'Fix punctuation']
+  },
+  ideas: {
+    color: '#ff6584',
+    label: 'Ideas Mode — Brainstorm creative and smart ideas for any topic.',
+    tabClass: 'ideas',
+    system: `You are APEX, a creative brainstorming partner. When generating ideas:
+- Give 5-7 distinct, creative ideas with brief explanations
+- Think outside the box while staying practical
+- Number each idea clearly
+- For each idea, mention WHY it's interesting or useful
+- Include both simple and ambitious ideas
+- Ask a follow-up question to refine further if needed
+Be energetic, creative, and inspiring. Make the person excited about possibilities.`,
+    hints: ['App ideas for beginners', 'Essay topic ideas', 'Business ideas', 'Creative project', 'Side hustle ideas']
+  }
+};
+
+function setMode(mode, btn) {
+  currentMode = mode;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active', 'school', 'grammar', 'ideas'));
+  btn.classList.add('active');
+  if (modeConfig[mode].tabClass) btn.classList.add(modeConfig[mode].tabClass);
+
+  const banner = document.getElementById('modeBanner');
+  const dot = banner.querySelector('.dot');
+  const text = document.getElementById('bannerText');
+  dot.style.background = modeConfig[mode].color;
+  text.textContent = modeConfig[mode].label;
+  banner.style.animation = 'none';
+  requestAnimationFrame(() => banner.style.animation = 'fadeSlide 0.3s ease');
+
+  const hintsEl = document.getElementById('hints');
+  hintsEl.innerHTML = modeConfig[mode].hints.map(h =>
+    `<span class="hint-chip" onclick="quickPrompt('${h}')">${h}</span>`
+  ).join('');
+}
+
+function quickPrompt(text) {
+  document.getElementById('input').value = text;
+  autoResize(document.getElementById('input'));
+  sendMessage();
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 160) + 'px';
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+}
+
+function addMessage(role, content, isThinking = false) {
+  const chatArea = document.getElementById('chatArea');
+  const emptyState = document.getElementById('emptyState');
+  if (emptyState) emptyState.remove();
+
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+
+  const avatarDiv = document.createElement('div');
+  avatarDiv.className = `avatar ${role === 'ai' ? 'ai' : 'user-av'}`;
+  avatarDiv.textContent = role === 'ai' ? 'A' : 'U';
+
+  const bubbleDiv = document.createElement('div');
+  bubbleDiv.className = 'bubble';
+
+  if (isThinking) {
+    bubbleDiv.innerHTML = `<div class="thinking"><span></span><span></span><span></span></div>`;
+  } else {
+    bubbleDiv.innerHTML = formatMessage(content, role);
+  }
+
+  div.appendChild(avatarDiv);
+  div.appendChild(bubbleDiv);
+  chatArea.appendChild(div);
+  chatArea.scrollTop = chatArea.scrollHeight;
+  return bubbleDiv;
+}
+
+function formatMessage(content, role) {
+  if (role === 'user') return escapeHtml(content);
+
+  // Add mode badge
+  const badges = { code: 'code-badge', school: 'school-badge', grammar: 'grammar-badge', ideas: 'ideas-badge' };
+  const labels = { code: '⌨️ CODE', school: '📚 SCHOOL', grammar: '✏️ GRAMMAR', ideas: '💡 IDEAS' };
+  const badgeHtml = `<span class="badge ${badges[currentMode]}">${labels[currentMode]}</span><br>`;
+
+  // Process code blocks
+  let formatted = content.replace(/```(\w+)?\n?([\s\S]*?)```/g, (match, lang, code) => {
+    return `<pre><span class="lang-tag">${lang || 'code'}</span>${escapeHtml(code.trim())}</pre>`;
+  });
+
+  // Inline code
+  formatted = formatted.replace(/`([^`]+)`/g, '<code style="background:var(--code-bg);padding:2px 6px;border-radius:4px;font-family:\'DM Mono\',monospace;font-size:0.82em">$1</code>');
+
+  // Bold
+  formatted = formatted.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+
+  // Grammar corrections ~~wrong~~ → correct
+  formatted = formatted.replace(/~~(.*?)~~\s*→\s*(.*?)(?=\n|<|$)/g,
+    '<div class="grammar-diff"><span class="original">$1</span><span class="arrow">→</span><span class="corrected">$2</span></div>');
+
+  // Numbered idea items (1. 2. etc at start of line)
+  formatted = formatted.replace(/^(\d+)\.\s+\*\*(.*?)\*\*:?\s*(.*)/gm,
+    '<div class="idea-card"><div class="idea-num">IDEA $1</div><strong>$2</strong>: $3</div>');
+
+  // Paragraphs
+  formatted = formatted.split('\n\n').map(p => {
+    if (p.includes('<pre>') || p.includes('<div class="') ) return p;
+    return `<p>${p.replace(/\n/g, '<br>')}</p>`;
+  }).join('');
+
+  return badgeHtml + formatted;
+}
+
+function escapeHtml(text) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+async function sendMessage() {
+  const input = document.getElementById('input');
+  const sendBtn = document.getElementById('sendBtn');
+  const text = input.value.trim();
+  if (!text) return;
+
+  input.value = '';
+  input.style.height = 'auto';
+  sendBtn.disabled = true;
+
+  addMessage('user', text);
+
+  const thinkingBubble = addMessage('ai', '', true);
+  messages.push({ role: 'user', content: text });
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        system: modeConfig[currentMode].system,
+        messages: messages
+      })
+    });
+
+    const data = await response.json();
+    const reply = data.content?.map(b => b.text || '').join('') || 'Sorry, I had trouble responding. Try again!';
+
+    thinkingBubble.innerHTML = formatMessage(reply, 'ai');
+    messages.push({ role: 'assistant', content: reply });
+
+    const chatArea = document.getElementById('chatArea');
+    chatArea.scrollTop = chatArea.scrollHeight;
+  } catch (err) {
+    thinkingBubble.innerHTML = formatMessage('⚠️ Something went wrong. Please try again.', 'ai');
+  }
+
+  sendBtn.disabled = false;
+  input.focus();
+}
+</script>
+
+
+</body></html>
